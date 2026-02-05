@@ -6,7 +6,6 @@ export LC_ALL=C
 LOG_LINES=()
 LOG_MIN=3
 LOG_MAX=10
-
 banner() {
   cat <<'EOF'
 ╔═════════════════════════════════════════════════════╗
@@ -726,3 +725,4 @@ main_menu() {
 ensure_root "$@"
 add_log "SEPEHR GRE+FORWARDER installer (HAProxy mode)."
 main_menu
+
