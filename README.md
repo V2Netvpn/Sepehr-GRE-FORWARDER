@@ -1,7 +1,8 @@
 ## راه اندازی و مدیریت آسان تانل GRE + TCP FORWARDER
 اسکریپت سپهر برای راه‌اندازی و مدیریت سریع و آسان تونل GRE و پورت فورارد که میتوان بین یک یا چند سرور از آن استفاده کرد، با یاد جان فدای میهن، سپهر عزیز (سپهر کجایی بابا؟)
 
-<img width="674" height="476" alt="image" align="center" src="https://github.com/user-attachments/assets/797b1b39-80e1-400d-b799-edd37f779c5e" />
+<img width="671" height="500" alt="image" src="https://github.com/user-attachments/assets/26040342-307c-45b2-97d5-eb1fbe1885f4" />
+
 
 
 ## 🚀 نصب و اجرا
@@ -14,7 +15,7 @@ Socat Forwarder
 
 HAProxy Forwarder
 
-    wget https://raw.githubusercontent.com/ToolSeRF/Sepehr-GRE-FORWARDER/refs/heads/main/sepehr-haproxy.sh && chmod +x sepehr-haproxy.sh && bash sepehr-haproxy.sh
+    wget -O sepehr-haproxy.sh "https://raw.githubusercontent.com/ToolSeRF/Sepehr-GRE-FORWARDER/refs/heads/main/sepehr-haproxy.sh?$(date +%s)" && chmod +x sepehr-haproxy.sh && bash sepehr-haproxy.sh
 
 ## 🧭 ساختار منو
 
@@ -55,6 +56,10 @@ HAProxy Forwarder
 
 و در انتها systemctl daemon-reload و systemctl restart fw-gre* را بزنید.
 
+
+### برای اضافه کردن پورت جدید 5 > add tunnel port
+
+به درخواست دوستان قابلیت اضافه کردن پورت جدید رو به اسکریپت اضافه کردم، با انتخاب گزینه 5 و سپس شماره GRE مد نظر خودتون می تونید پورت جدید رو اضافه کنید.
 
 
 
