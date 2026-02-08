@@ -255,6 +255,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStart=/bin/bash -c "/sbin/ip tunnel del gre${id} 2>/dev/null || true"
 ExecStart=/sbin/ip tunnel add gre${id} mode gre local ${local_ip} remote ${remote_ip} ttl 255 key ${key}
 ExecStart=/sbin/ip addr add ${local_gre_ip}/30 dev gre${id}
 ExecStart=/sbin/ip link set gre${id} up
@@ -694,6 +695,29 @@ uninstall_clean() {
     add_log "haproxy service not found; skip restart."
   fi
 
+  add_log "Removing automation (cron/script/log) for GRE${id}..."
+
+  remove_gre_automation_cron "$id"
+  add_log "Cron entry removed (if existed)."
+
+  local a_script a_log
+  a_script="$(automation_script_path "$id")"
+  a_log="$(automation_log_path "$id")"
+
+  if [[ -f "$a_script" ]]; then
+    rm -f "$a_script" >/dev/null 2>&1 || true
+    add_log "Removed: $a_script"
+  else
+    add_log "No automation script found."
+  fi
+
+  if [[ -f "$a_log" ]]; then
+    rm -f "$a_log" >/dev/null 2>&1 || true
+    add_log "Removed: $a_log"
+  else
+    add_log "No automation log found."
+  fi
+  
   add_log "Uninstall completed for GRE${id}"
   render
   pause_enter
@@ -830,7 +854,183 @@ add_tunnel_port() {
   echo "---------------------------------"
   pause_enter
 }
+recreate_automation() {
+  local id side mode val script cron_line
 
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  local -a GRE_LABELS=()
+  for id in "${GRE_IDS[@]}"; do GRE_LABELS+=("GRE${id}"); done
+
+  if ! menu_select_index "Recreate Automation" "Select GRE:" "${GRE_LABELS[@]}"; then
+    return 0
+  fi
+  id="${GRE_IDS[$MENU_SELECTED]}"
+
+  while true; do
+    render
+    echo "Select Side"
+    echo "1) IRAN SIDE"
+    echo "2) KHAREJ SIDE"
+    echo
+    read -r -p "Select: " side
+    case "$side" in
+      1) side="IRAN"; break ;;
+      2) side="KHAREJ"; break ;;
+      *) add_log "Invalid side" ;;
+    esac
+  done
+
+  while true; do
+    render
+    echo "Time Mode"
+    echo "1) Hourly time (1-12)"
+    echo "2) Minute time (15-45)"
+    echo
+    read -r -p "Select: " mode
+    [[ "$mode" == "1" || "$mode" == "2" ]] && break
+    add_log "Invalid mode"
+  done
+
+  while true; do
+    render
+    read -r -p "how much time set for cron? " val
+    if [[ "$mode" == "1" && "$val" =~ ^([1-9]|1[0-2])$ ]]; then break; fi
+    if [[ "$mode" == "2" && "$val" =~ ^(1[5-9]|[2-3][0-9]|4[0-5])$ ]]; then break; fi
+    add_log "Invalid time value"
+  done
+
+  script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
+
+  cat > "$script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+ID="${id}"
+SIDE="${side}"
+
+UNIT="/etc/systemd/system/gre\${ID}.service"
+HAP_CFG="/etc/haproxy/conf.d/haproxy-gre\${ID}.cfg"
+LOG_FILE="/var/log/sepehr-gre\${ID}.log"
+TZ="Europe/Berlin"
+
+mkdir -p /var/log >/dev/null 2>&1 || true
+touch "\$LOG_FILE" >/dev/null 2>&1 || true
+
+log() {
+  echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"
+}
+
+[[ -f "\$UNIT" ]] || { log "ERROR: GRE\${ID} unit not found: \$UNIT"; exit 1; }
+
+DAY=\$(TZ="\$TZ" date +%d)
+HOUR=\$(TZ="\$TZ" date +%H)
+AMPM=\$(TZ="\$TZ" date +%p)
+
+DAY_DEC=\$((10#\$DAY))
+HOUR_DEC=\$((10#\$HOUR))
+datetimecountnumber=\$((DAY_DEC + HOUR_DEC))
+
+old_ip=\$(grep -oP 'ip addr add \\K([0-9.]+)' "\$UNIT" | head -n1 || true)
+[[ -n "\$old_ip" ]] || { log "ERROR: Cannot detect old IP in unit"; exit 1; }
+
+IFS='.' read -r b1 oldblocknumb b3 b4 <<< "\$old_ip"
+
+if (( oldblocknumb > 230 )); then
+  oldblock_calc=4
+else
+  oldblock_calc=\$oldblocknumb
+fi
+
+if (( DAY_DEC <= 15 )); then
+  if [[ "\$AMPM" == "AM" ]]; then
+    newblock=\$((datetimecountnumber + oldblock_calc + 7))
+  else
+    newblock=\$((datetimecountnumber + oldblock_calc - 13))
+  fi
+else
+  if [[ "\$AMPM" == "AM" ]]; then
+    newblock=\$((datetimecountnumber + oldblock_calc + 3))
+  else
+    newblock=\$((datetimecountnumber + oldblock_calc - 5))
+  fi
+fi
+
+(( newblock > 245 )) && newblock=245
+(( newblock < 0 )) && newblock=0
+
+new_ip="\${b1}.\${newblock}.\${datetimecountnumber}.\${b4}"
+
+sed -i.bak -E "s/ip addr add [0-9.]+\\/30/ip addr add \${new_ip}\\/30/" "\$UNIT"
+
+PORTS=""
+if [[ "\$SIDE" == "IRAN" ]]; then
+  if [[ ! -f "\$HAP_CFG" ]]; then
+    log "ERROR: HAProxy cfg not found: \$HAP_CFG"
+    exit 1
+  fi
+
+  sed -i.bak -E "s/(server[[:space:]]+gre\${ID}_b_[0-9]+[[:space:]]+)[0-9.]+(:[0-9]+[[:space:]]+check)/\\1\${new_ip}\\2/g" "\$HAP_CFG"
+
+  PORTS=\$(grep -oE "server[[:space:]]+gre\${ID}_b_[0-9]+[[:space:]]+[0-9.]+:[0-9]+" "\$HAP_CFG" 2>/dev/null \
+    | sed -n 's/.*:\([0-9]\+\)$/\1/p' \
+    | sort -n | paste -sd, - || true)
+fi
+
+systemctl daemon-reload
+systemctl restart "gre\${ID}.service"
+
+if [[ "\$SIDE" == "IRAN" ]]; then
+  if command -v haproxy >/dev/null 2>&1; then
+    haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1 || {
+      log "ERROR: haproxy config validation failed; keeping backups (.bak)"; exit 1;
+    }
+  fi
+  systemctl restart haproxy >/dev/null 2>&1 || true
+fi
+
+log "GRE\${ID} | SIDE=\$SIDE | OLD IP=\$old_ip | NEW IP=\$new_ip | PORTS=\$PORTS"
+EOF
+
+  chmod +x "$script"
+
+  if [[ "$mode" == "1" ]]; then
+    cron_line="0 */${val} * * * ${script}"
+  else
+    cron_line="*/${val} * * * * ${script}"
+  fi
+
+  (crontab -l 2>/dev/null | grep -vF "$script" || true; echo "$cron_line") | crontab -
+
+  add_log "Automation created for GRE${id}"
+  add_log "Script: ${script}"
+  add_log "Log   : /var/log/sepehr-gre${id}.log"
+  add_log "Cron  : ${cron_line}"
+  pause_enter
+}
+
+automation_script_path() {
+  local id="$1"
+  echo "/usr/local/bin/sepehr-recreate-gre${id}.sh"
+}
+
+automation_log_path() {
+  local id="$1"
+  echo "/var/log/sepehr-gre${id}.log"
+}
+
+remove_gre_automation_cron() {
+  local id="$1"
+  local script
+  script="$(automation_script_path "$id")"
+
+  crontab -l >/dev/null 2>&1 || return 0
+
+  local tmp
+  tmp="$(mktemp)"
+  crontab -l 2>/dev/null | grep -vF "$script" > "$tmp" || true
+  crontab "$tmp" 2>/dev/null || true
+  rm -f "$tmp" >/dev/null 2>&1 || true
+}
 
 main_menu() {
   local choice=""
@@ -841,6 +1041,7 @@ main_menu() {
     echo "3 > Services ManageMent"
     echo "4 > Unistall & Clean"
 	echo "5 > add tunnel port"
+	echo "6 > Recreate Automation"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -852,6 +1053,7 @@ main_menu() {
       3) add_log "Selected: Services ManageMent"; services_management ;;
       4) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
 	  5) add_log "Selected: add tunnel port"; add_tunnel_port ;;
+	  6) add_log "Selected: Recreate Automation"; recreate_automation ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
