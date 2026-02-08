@@ -568,6 +568,7 @@ services_management() {
     esac
   done
 }
+
 uninstall_clean() {
   mapfile -t GRE_IDS < <(get_gre_ids)
   local -a GRE_LABELS=()
@@ -582,14 +583,19 @@ uninstall_clean() {
 
   local idx="$MENU_SELECTED"
   id="${GRE_IDS[$idx]}"
+
   while true; do
     render
     echo "Uninstall & Clean"
     echo
     echo "Target: GRE${id}"
     echo "This will remove:"
-    echo "  - gre${id}.service"
-    echo "  - fw-gre${id}-*.service"
+    echo "  - /etc/systemd/system/gre${id}.service"
+    echo "  - /etc/systemd/system/fw-gre${id}-*.service"
+    echo "  - cron + /usr/local/bin/sepehr-recreate-gre${id}.sh (if exists)"
+    echo "  - /var/log/sepehr-gre${id}.log (if exists)"
+    echo "  - /root/gre-backup/gre${id}.service (if exists)"
+    echo "  - /root/gre-backup/fw-gre${id}-*.service (if exists)"
     echo
     echo "Type: YES (confirm)  or  NO (cancel)"
     echo
@@ -606,10 +612,12 @@ uninstall_clean() {
     fi
     add_log "Please type YES or NO."
   done
+
   add_log "Stopping gre${id}.service"
   systemctl stop "gre${id}.service" >/dev/null 2>&1 || true
   add_log "Disabling gre${id}.service"
   systemctl disable "gre${id}.service" >/dev/null 2>&1 || true
+
   mapfile -t FW_UNITS < <(get_fw_units_for_id "$id")
   if ((${#FW_UNITS[@]} > 0)); then
     local u
@@ -622,14 +630,16 @@ uninstall_clean() {
   else
     add_log "No forwarders found for GRE${id}"
   fi
+
   add_log "Removing unit files..."
   rm -f "/etc/systemd/system/gre${id}.service" >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/fw-gre${id}-*.service >/dev/null 2>&1 || true
+
   add_log "Reloading systemd..."
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl reset-failed  >/dev/null 2>&1 || true
 
-  add_log "Removing automation (cron/script/log) for GRE${id}..."
+  add_log "Removing automation (cron/script/log/backup) for GRE${id}..."
 
   remove_gre_automation_cron "$id"
   add_log "Cron entry removed (if existed)."
@@ -651,6 +661,8 @@ uninstall_clean() {
   else
     add_log "No automation log found."
   fi
+
+  remove_gre_automation_backups "$id"
 
   add_log "Uninstall completed for GRE${id}"
   render
@@ -812,7 +824,7 @@ recreate_automation() {
   local -a GRE_LABELS=()
   for id in "${GRE_IDS[@]}"; do GRE_LABELS+=("GRE${id}"); done
 
-  if ! menu_select_index "Recreate Automation" "Select GRE:" "${GRE_LABELS[@]}"; then
+  if ! menu_select_index "Regenerate Automation" "Select GRE:" "${GRE_LABELS[@]}"; then
     return 0
   fi
   id="${GRE_IDS[$MENU_SELECTED]}"
@@ -957,31 +969,206 @@ EOF
   pause_enter
 }
 
-
-
-automation_script_path() {
-  local id="$1"
-  echo "/usr/local/bin/sepehr-recreate-gre${id}.sh"
+automation_backup_dir() {
+  echo "/root/gre-backup"
 }
 
-automation_log_path() {
+remove_gre_automation_backups() {
   local id="$1"
-  echo "/var/log/sepehr-gre${id}.log"
+  local bakdir
+  bakdir="$(automation_backup_dir)"
+
+  [[ -d "$bakdir" ]] || { add_log "Backup dir not found: $bakdir"; return 0; }
+
+  local removed_any=0
+
+  if [[ -f "$bakdir/gre${id}.service" ]]; then
+    rm -f "$bakdir/gre${id}.service" >/dev/null 2>&1 || true
+    add_log "Removed backup: $bakdir/gre${id}.service"
+    removed_any=1
+  fi
+
+  local fw
+  shopt -s nullglob
+  for fw in "$bakdir"/fw-gre${id}-*.service; do
+    rm -f "$fw" >/dev/null 2>&1 || true
+    add_log "Removed backup: $fw"
+    removed_any=1
+  done
+  shopt -u nullglob
+
+  [[ $removed_any -eq 0 ]] && add_log "No backup files found for GRE${id}."
 }
 
-remove_gre_automation_cron() {
-  local id="$1"
-  local script
-  script="$(automation_script_path "$id")"
 
-  crontab -l >/dev/null 2>&1 || return 0
+recreate_automation_mode() {
+  local id side mode val script cron_line
 
-  local tmp
-  tmp="$(mktemp)"
-  crontab -l 2>/dev/null | grep -vF "$script" > "$tmp" || true
-  crontab "$tmp" 2>/dev/null || true
-  rm -f "$tmp" >/dev/null 2>&1 || true
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  local -a GRE_LABELS=()
+  for id in "${GRE_IDS[@]}"; do GRE_LABELS+=("GRE${id}"); done
+
+  if ! menu_select_index "Rebuild Automation" "Select GRE:" "${GRE_LABELS[@]}"; then
+    return 0
+  fi
+  id="${GRE_IDS[$MENU_SELECTED]}"
+
+  while true; do
+    render
+    echo "Select Side"
+    echo "1) IRAN SIDE"
+    echo "2) KHAREJ SIDE"
+    echo
+    read -r -p "Select: " side
+    case "$side" in
+      1) side="IRAN"; break ;;
+      2) side="KHAREJ"; break ;;
+      *) add_log "Invalid side" ;;
+    esac
+  done
+
+  select_and_set_timezone || { die_soft "Timezone/NTP setup failed."; return 0; }
+
+  while true; do
+    render
+    echo "Time Mode"
+    echo "1) Hourly time (1-12)"
+    echo "2) Minute time (15-45)"
+    echo
+    read -r -p "Select: " mode
+    [[ "$mode" == "1" || "$mode" == "2" ]] && break
+    add_log "Invalid mode"
+  done
+
+  while true; do
+    render
+    read -r -p "how much time set for cron? " val
+    if [[ "$mode" == "1" && "$val" =~ ^([1-9]|1[0-2])$ ]]; then break; fi
+    if [[ "$mode" == "2" && "$val" =~ ^(1[5-9]|[2-3][0-9]|4[0-5])$ ]]; then break; fi
+    add_log "Invalid time value"
+  done
+
+  script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
+
+  cat > "$script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+ID="${id}"
+SIDE="${side}"
+
+UNIT="/etc/systemd/system/gre\${ID}.service"
+LOG_FILE="/var/log/sepehr-gre\${ID}.log"
+BACKUP_DIR="/root/gre-backup"
+TZ="Europe/Berlin"
+
+mkdir -p /var/log >/dev/null 2>&1 || true
+touch "\$LOG_FILE" >/dev/null 2>&1 || true
+mkdir -p "\$BACKUP_DIR" >/dev/null 2>&1 || true
+
+log() { echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"; }
+
+list_fw_units() {
+  find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre\${ID}-*.service" 2>/dev/null | sort -V || true
 }
+
+if [[ ! -f "\$UNIT" ]]; then
+  log "ERROR: gre unit not found: \$UNIT"
+  exit 1
+fi
+
+GRE_BAK="\$BACKUP_DIR/gre\${ID}.service"
+if [[ ! -f "\$GRE_BAK" ]]; then
+  cp -a "\$UNIT" "\$GRE_BAK"
+  log "BACKUP created: \$GRE_BAK"
+else
+  log "BACKUP exists: \$GRE_BAK"
+fi
+
+FW_COUNT=0
+if [[ "\$SIDE" == "IRAN" ]]; then
+  while IFS= read -r fw_path; do
+    [[ -n "\$fw_path" ]] || continue
+    fw_base="\$(basename "\$fw_path")"
+    fw_bak="\$BACKUP_DIR/\$fw_base"
+    if [[ ! -f "\$fw_bak" ]]; then
+      cp -a "\$fw_path" "\$fw_bak"
+      log "BACKUP created: \$fw_bak"
+    else
+      log "BACKUP exists: \$fw_bak"
+    fi
+    ((FW_COUNT++)) || true
+  done < <(list_fw_units)
+fi
+
+systemctl stop "gre\${ID}.service" >/dev/null 2>&1 || true
+systemctl disable "gre\${ID}.service" >/dev/null 2>&1 || true
+
+if [[ "\$SIDE" == "IRAN" ]]; then
+  while IFS= read -r fw_path; do
+    [[ -n "\$fw_path" ]] || continue
+    fw_unit="\$(basename "\$fw_path")"
+    systemctl stop "\$fw_unit" >/dev/null 2>&1 || true
+    systemctl disable "\$fw_unit" >/dev/null 2>&1 || true
+  done < <(list_fw_units)
+fi
+
+rm -f "\$UNIT" >/dev/null 2>&1 || true
+
+if [[ "\$SIDE" == "IRAN" ]]; then
+  rm -f /etc/systemd/system/fw-gre\${ID}-*.service >/dev/null 2>&1 || true
+fi
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl reset-failed  >/dev/null 2>&1 || true
+
+if [[ ! -f "\$GRE_BAK" ]]; then
+  log "ERROR: missing gre backup: \$GRE_BAK"
+  exit 1
+fi
+cp -a "\$GRE_BAK" "\$UNIT"
+
+RESTORED_FW=0
+if [[ "\$SIDE" == "IRAN" ]]; then
+  for fw_bak in "\$BACKUP_DIR"/fw-gre\${ID}-*.service; do
+    [[ -f "\$fw_bak" ]] || continue
+    cp -a "\$fw_bak" "/etc/systemd/system/\$(basename "\$fw_bak")"
+    ((RESTORED_FW++)) || true
+  done
+fi
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+systemctl enable --now "gre\${ID}.service" >/dev/null 2>&1 || true
+
+if [[ "\$SIDE" == "IRAN" ]]; then
+  for fw_unit in /etc/systemd/system/fw-gre\${ID}-*.service; do
+    [[ -f "\$fw_unit" ]] || continue
+    systemctl enable --now "\$(basename "\$fw_unit")" >/dev/null 2>&1 || true
+  done
+fi
+
+log "Rebuild OK | GRE\${ID} | SIDE=\$SIDE | restored gre + fw from backups | fw_backup_seen=\$FW_COUNT | fw_restored=\$RESTORED_FW"
+EOF
+
+  chmod +x "$script"
+
+  if [[ "$mode" == "1" ]]; then
+    cron_line="0 */${val} * * * ${script}"
+  else
+    cron_line="*/${val} * * * * ${script}"
+  fi
+
+  (crontab -l 2>/dev/null | grep -vF "$script" || true; echo "$cron_line") | crontab -
+
+  add_log "Automation created for GRE${id}"
+  add_log "Script: ${script}"
+  add_log "Backup: /root/gre-backup/ (gre${id}.service + fw-gre${id}-*.service)"
+  add_log "Log   : /var/log/sepehr-gre${id}.log"
+  add_log "Cron  : ${cron_line}"
+  pause_enter
+}
+
 
 main_menu() {
   local choice=""
@@ -992,7 +1179,8 @@ main_menu() {
     echo "3 > Services ManageMent"
     echo "4 > Unistall & Clean"
 	echo "5 > add tunnel port"
-	echo "6 > Recreate Automation"
+	echo "6 > Rebuild Automation"
+	echo "7 > Regenerate Automation"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -1004,7 +1192,8 @@ main_menu() {
       3) add_log "Selected: Services ManageMent"; services_management ;;
       4) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
 	  5) add_log "Selected: add tunnel port"; add_tunnel_port ;;
-	  6) add_log "Selected: Recreate Automation"; recreate_automation ;;
+	  6) add_log "Selected: Rebuild Automation"; recreate_automation_mode ;;
+	  7) add_log "Selected: Regenerate Automation"; recreate_automation ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
