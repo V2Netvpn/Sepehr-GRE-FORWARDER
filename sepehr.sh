@@ -749,6 +749,62 @@ add_tunnel_port() {
   done
   pause_enter
 }
+
+
+select_and_set_timezone() {
+  local choice tz=""
+  while true; do
+    render
+    echo "WARNING: You need set mutual Time to IRAN and Kharej Server"
+    echo "select your server clock"
+    echo
+    echo "1) Germany (Europe/Berlin)"
+    echo "2) Turkey (Europe/Istanbul)"
+    echo "3) France (Europe/Paris)"
+    echo "4) Netherlands (Europe/Amsterdam)"
+    echo "5) Finland (Europe/Helsinki)"
+    echo "6) England (Europe/London)"
+    echo "7) Sweden (Europe/Stockholm)"
+    echo "8) Russia (Europe/Moscow)"
+    echo "9) USA (America/New_York)"
+    echo "10) Canada (America/Toronto)"
+    echo "11) UTC (Etc/UTC)"
+    echo "0) Skip (no change)"
+    echo
+
+    read -r -p "Select: " choice
+    choice="$(trim "$choice")"
+
+    case "$choice" in
+      1) tz="Europe/Berlin" ;;
+      2) tz="Europe/Istanbul" ;;
+      3) tz="Europe/Paris" ;;
+      4) tz="Europe/Amsterdam" ;;
+      5) tz="Europe/Helsinki" ;;
+      6) tz="Europe/London" ;;
+      7) tz="Europe/Stockholm" ;;
+      8) tz="Europe/Moscow" ;;
+      9) tz="America/New_York" ;;
+      10) tz="America/Toronto" ;;
+      11) tz="Etc/UTC" ;;
+      0) add_log "Timezone setup skipped."; return 0 ;;
+      *) add_log "Invalid selection: $choice"; continue ;;
+    esac
+
+    add_log "Setting timezone: $tz"
+    render
+
+    timedatectl set-timezone "$tz" >/dev/null 2>&1 || { add_log "ERROR: failed set-timezone"; return 1; }
+    timedatectl set-ntp true >/dev/null 2>&1 || { add_log "ERROR: failed set-ntp true"; return 1; }
+
+    local now
+    now="$(TZ="$tz" date '+%Y-%m-%d %H:%M %Z')"
+    add_log "Timezone set OK: $tz | Now: $now"
+    return 0
+  done
+}
+
+
 recreate_automation() {
   local id side mode val script cron_line
 
@@ -774,7 +830,7 @@ recreate_automation() {
       *) add_log "Invalid side" ;;
     esac
   done
-
+  select_and_set_timezone || { die_soft "Timezone/NTP setup failed."; return 0; }
   while true; do
     render
     echo "Time Mode"
