@@ -201,3 +201,78 @@ else
 fi
 
 run_sepehr_with_tty "$payload"
+
+# ---------------------------
+# FINAL STATUS OUTPUT
+# ---------------------------
+echo
+echo "=================================================="
+echo " GRE SETUP RESULT"
+echo "--------------------------------------------------"
+echo " Side        : $SIDE"
+echo " GRE ID      : $GRE_ID"
+echo " Interface   : gre$GRE_ID"
+echo " Local IP    : $LOCAL_IP"
+echo " Peer IP     : $PEER_IP"
+echo " GRE Base    : $GRE_BASE"
+echo " MTU         : $DEFAULT_MTU_VALUE"
+echo "--------------------------------------------------"
+
+# Check interface
+if ip link show "gre$GRE_ID" >/dev/null 2>&1; then
+  IF_STATE=$(ip link show "gre$GRE_ID" | grep -q "UP" && echo "UP" || echo "DOWN")
+  echo " Interface   : $IF_STATE"
+else
+  echo " Interface   : NOT FOUND"
+fi
+
+# Check systemd service
+if systemctl is-active --quiet "gre$GRE_ID.service"; then
+  echo " Service     : ACTIVE"
+else
+  echo " Service     : INACTIVE"
+fi
+
+# Show GRE IPs if exist
+GRE_IPS=$(ip addr show "gre$GRE_ID" 2>/dev/null | awk '/inet /{print $2}')
+if [[ -n "$GRE_IPS" ]]; then
+  echo " Tunnel IP   : $GRE_IPS"
+else
+  echo " Tunnel IP   : NOT ASSIGNED"
+fi
+
+echo "=================================================="
+echo
+
+
+# ---------------------------
+# PING PEER CHECK (LIVE + SUMMARY)
+# ---------------------------
+echo "--------------------------------------------------"
+echo " Ping Peer   : $PEER_IP (live)"
+
+PING_LOG="/tmp/ping_peer_${GRE_ID}.log"
+rm -f "$PING_LOG" 2>/dev/null || true
+
+if command -v ping >/dev/null 2>&1; then
+  # live output on screen + save to log
+  set +e
+  ping -c "$PING_COUNT" -W "$PING_TIMEOUT_SEC" "$PEER_IP" 2>&1 | tee "$PING_LOG"
+  PING_RC=${PIPESTATUS[0]}
+  set -e
+
+  # summary
+  LOSS=$(awk -F',' '/packet loss/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}' "$PING_LOG" | head -n1)
+  RTT=$(awk -F'=' '/^rtt|^round-trip/ {print $2}' "$PING_LOG" | awk '{print $1}' | head -n1)
+
+  if [[ $PING_RC -eq 0 ]]; then
+    echo " Ping Result : OK (${LOSS:-"0% packet loss"})"
+  else
+    echo " Ping Result : FAIL (${LOSS:-"unknown loss"})"
+  fi
+
+  [[ -n "$RTT" ]] && echo " RTT (ms)    : $RTT"
+else
+  echo " Ping Result : ping command not found"
+fi
+
