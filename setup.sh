@@ -108,51 +108,21 @@ cleanup_existing_services() {
 run_sepehr_with_tty() {
   local payload="$1"
 
-  # How long we allow sepehr.sh to run before we assume it is stuck at menu
-  local SEPEHR_TIMEOUT_SEC="${SEPEHR_TIMEOUT_SEC:-180}"
-
-  # write payload to temp file (more reliable than <<< with pty)
-  local tmp
-  tmp="$(mktemp /tmp/sepehr_payload.XXXXXX)"
-  printf "%s" "$payload" > "$tmp"
-
-  # If timeout exists, use it to avoid Ctrl+C from user
-  local TIMEOUT_BIN=""
-  if command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_BIN="timeout -k 5s ${SEPEHR_TIMEOUT_SEC}s"
-  fi
-
-  # Prefer 'script' => pseudo-tty for interactive reads
+  # Prefer 'script' => pseudo-tty for read -e safety
   if command -v script >/dev/null 2>&1; then
-    # Feed stdin from payload file
-    # Note: some sepehr versions may loop menu forever even after 0; timeout prevents hang.
-    set +e
-    if [[ -n "$TIMEOUT_BIN" ]]; then
-      $TIMEOUT_BIN script -q -e -c "bash $SEPEHR_FILE" /dev/null < "$tmp"
-      rc=$?
-    else
-      script -q -e -c "bash $SEPEHR_FILE" /dev/null < "$tmp"
-      rc=$?
-    fi
-    set -e
-    rm -f "$tmp" >/dev/null 2>&1 || true
-    return "$rc"
+    # NOTE: sepehr.sh is interactive; script provides a pty
+    script -q -c "bash $SEPEHR_FILE" /dev/null <<<"$payload"
+    return $?
   fi
 
-  # Fallback without script (less reliable but works)
-  set +e
-  if [[ -n "$TIMEOUT_BIN" ]]; then
-    $TIMEOUT_BIN bash "$SEPEHR_FILE" < "$tmp"
-    rc=$?
-  else
-    bash "$SEPEHR_FILE" < "$tmp"
-    rc=$?
+  # Fallback
+  if command -v stdbuf >/dev/null 2>&1; then
+    printf "%s" "$payload" | stdbuf -i0 -o0 -e0 bash "$SEPEHR_FILE"
+    return $?
   fi
-  set -e
-  rm -f "$tmp" >/dev/null 2>&1 || true
-  return "$rc"
+
+  printf "%s" "$payload" | bash "$SEPEHR_FILE"
 }
-
 
 gre_private_ips() {
   # input: GRE_BASE like 10.60.60.0
