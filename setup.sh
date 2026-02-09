@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
-# setup.sh  (CLI wrapper for NEW sepehr.sh with MTU prompt + avoids menu spam/hang)
+# setup.sh  (CLI wrapper for sepehr.sh)
 #
 # Usage:
-#   ./setup.sh iran  <peer_ip> <gre_number>
-#   ./setup.sh khrej <peer_ip> <gre_number>
+#   ./setup.sh iran  <peer_public_ip> <gre_number>
+#   ./setup.sh khrej <peer_public_ip> <gre_number>
 #
-# Features:
-# - Auto-detect LOCAL IPv4 from this server
-# - GRE base: 10.<n>0.<n>0.0    (n = single digit 0..9)
-# - Ports fixed to 80 (iran only)
-# - MTU prompt auto-answered (DEFAULT_MTU_ENABLE="n" by request)
-# - Cleans existing greN + fw-greN-* services before setup
-# - Downloads latest sepehr.sh from repo
-# - Runs sepehr.sh with pseudo-TTY (script) to avoid "Invalid option" spam
-# - Sends ENTER for pause_enter and then 0 to exit menu (fixes hanging at menu)
+# Fixes:
+# - No hang at menu: sends multiple ENTER/0 tail to guarantee exit
+# - No "unbound variable" under set -u
+# - Final summary + LIVE ping over GRE using PRIVATE peer IP:
+#     iran  : local 10.<n>0.<n>0.1  -> peer 10.<n>0.<n>0.2
+#     khrej : local 10.<n>0.<n>0.2  -> peer 10.<n>0.<n>0.1
 
 set -euo pipefail
 
@@ -24,8 +21,17 @@ SEPEHR_RAW_URL="https://raw.githubusercontent.com/V2Netvpn/Sepehr-GRE-FORWARDER/
 SEPEHR_FILE="./sepehr.sh"
 
 PORTS="80"                 # iran side only
-DEFAULT_MTU_ENABLE="n"      # ✅ requested (y/n)
+DEFAULT_MTU_ENABLE="n"      # y/n
 DEFAULT_MTU_VALUE="1376"    # only used if DEFAULT_MTU_ENABLE=y
+
+# Private GRE ping settings
+PING_COUNT=5
+PING_TIMEOUT_SEC=1
+
+# Tail inputs to force exit from sepehr menu reliably:
+# - extra ENTERs cover any "Press ENTER to continue"
+# - extra 0s cover repeated menu returns
+MENU_EXIT_TAIL=$'\n\n0\n0\n0\n0\n\n'
 
 # ---------------------------
 # Helpers
@@ -76,11 +82,9 @@ cleanup_existing_services() {
   local id="$1"
   echo "[CLEAN] GRE${id}: stopping/disabling/removing old units if exist..."
 
-  # Stop/disable GRE
   systemctl stop "gre${id}.service" >/dev/null 2>&1 || true
   systemctl disable "gre${id}.service" >/dev/null 2>&1 || true
 
-  # Stop/disable forwarders
   local u
   while IFS= read -r u; do
     [[ -n "$u" ]] || continue
@@ -88,11 +92,9 @@ cleanup_existing_services() {
     systemctl disable "$u" >/dev/null 2>&1 || true
   done < <(systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -E "^fw-gre${id}-[0-9]+\.service$" || true)
 
-  # Remove unit files
   rm -f "/etc/systemd/system/gre${id}.service" >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/fw-gre${id}-*.service >/dev/null 2>&1 || true
 
-  # Remove live tunnel (best-effort)
   if command -v ip >/dev/null 2>&1; then
     ip tunnel del "gre${id}" >/dev/null 2>&1 || true
   fi
@@ -108,6 +110,7 @@ run_sepehr_with_tty() {
 
   # Prefer 'script' => pseudo-tty for read -e safety
   if command -v script >/dev/null 2>&1; then
+    # NOTE: sepehr.sh is interactive; script provides a pty
     script -q -c "bash $SEPEHR_FILE" /dev/null <<<"$payload"
     return $?
   fi
@@ -121,20 +124,54 @@ run_sepehr_with_tty() {
   printf "%s" "$payload" | bash "$SEPEHR_FILE"
 }
 
+gre_private_ips() {
+  # input: GRE_BASE like 10.60.60.0
+  # output: "local peer" based on side
+  local base="$1"
+  local side="$2"
+
+  local a b c d
+  IFS='.' read -r a b c d <<<"$base" || return 1
+
+  local ip1="${a}.${b}.${c}.1"
+  local ip2="${a}.${b}.${c}.2"
+
+  if [[ "$side" == "iran" ]]; then
+    echo "$ip1 $ip2"
+  else
+    echo "$ip2 $ip1"
+  fi
+}
+
+wait_for_iface() {
+  local ifname="$1"
+  local tries="${2:-40}" # 40 * 0.25 = 10s
+  local i
+  for ((i=0; i<tries; i++)); do
+    if ip link show "$ifname" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 usage() {
   cat <<'EOF'
 Usage:
-  ./setup.sh iran  <peer_ip> <gre_number>
-  ./setup.sh khrej <peer_ip> <gre_number>
+  ./setup.sh iran  <peer_public_ip> <gre_number>
+  ./setup.sh khrej <peer_public_ip> <gre_number>
 
 Examples:
-  ./setup.sh iran  45.89.52.101 4
-  ./setup.sh khrej 51.89.227.134 4
+  ./setup.sh iran  45.89.52.101 6
+  ./setup.sh khrej 54.38.224.119 6
 
 Notes:
-  - Local IP is detected automatically.
-  - GRE base is built as 10.<n>0.<n>0.0 (n single digit).
-  - MTU auto-answered with DEFAULT_MTU_ENABLE (currently: n).
+  - Local IPv4 detected automatically.
+  - GRE base: 10.<n>0.<n>0.0 (n single digit 0..9).
+  - Private ping:
+      iran  => ping 10.<n>0.<n>0.2 via greN
+      khrej => ping 10.<n>0.<n>0.1 via greN
 EOF
 }
 
@@ -153,7 +190,7 @@ case "$SIDE" in
   *) die "Invalid side '$SIDE'. Use: iran | khrej" ;;
 esac
 
-valid_ipv4 "$PEER_IP" || die "Peer IP invalid: $PEER_IP"
+valid_ipv4 "$PEER_IP" || die "Peer public IP invalid: $PEER_IP"
 [[ "$GRE_ID" =~ ^[0-9]$ ]] || die "grenumber must be single digit (0..9). Got: $GRE_ID"
 
 DEFAULT_MTU_ENABLE="${DEFAULT_MTU_ENABLE,,}"
@@ -173,7 +210,7 @@ echo "[INFO] PEER IP  : $PEER_IP"
 echo "[INFO] GRE NUM  : $GRE_ID"
 echo "[INFO] GRE BASE : $GRE_BASE"
 echo "[INFO] PORTS    : $PORTS (iran only)"
-echo "[INFO] MTU      : ${DEFAULT_MTU_ENABLE}${DEFAULT_MTU_ENABLE:+ }${DEFAULT_MTU_VALUE}"
+echo "[INFO] MTU      : ${DEFAULT_MTU_ENABLE} ${DEFAULT_MTU_VALUE}"
 echo
 
 cleanup_existing_services "$GRE_ID"
@@ -181,62 +218,72 @@ download_sepehr
 
 # ---------------------------
 # Payload builder (IMPORTANT)
-# - Must include:
+# - Includes:
 #   - MTU prompt answer
-#   - an ENTER for pause_enter
-#   - then 0 to exit main menu
+#   - multiple ENTERs/0 to force exit (prevents hanging at menu)
 # ---------------------------
+payload=""
+
 if [[ "$SIDE" == "iran" ]]; then
   if [[ "$DEFAULT_MTU_ENABLE" == "y" ]]; then
-    payload=$'1\n'"$GRE_ID"$'\n'"$LOCAL_IP"$'\n'"$PEER_IP"$'\n'"$GRE_BASE"$'\n'"$PORTS"$'\n'"$DEFAULT_MTU_ENABLE"$'\n'"$DEFAULT_MTU_VALUE"$'\n\n0\n'
+    payload=$'1\n'"$GRE_ID"$'\n'"$LOCAL_IP"$'\n'"$PEER_IP"$'\n'"$GRE_BASE"$'\n'"$PORTS"$'\n'"$DEFAULT_MTU_ENABLE"$'\n'"$DEFAULT_MTU_VALUE""$MENU_EXIT_TAIL"
   else
-    payload=$'1\n'"$GRE_ID"$'\n'"$LOCAL_IP"$'\n'"$PEER_IP"$'\n'"$GRE_BASE"$'\n'"$PORTS"$'\n'"$DEFAULT_MTU_ENABLE"$'\n\n0\n'
+    payload=$'1\n'"$GRE_ID"$'\n'"$LOCAL_IP"$'\n'"$PEER_IP"$'\n'"$GRE_BASE"$'\n'"$PORTS"$'\n'"$DEFAULT_MTU_ENABLE""$MENU_EXIT_TAIL"
   fi
 else
   if [[ "$DEFAULT_MTU_ENABLE" == "y" ]]; then
-    payload=$'2\n'"$GRE_ID"$'\n'"$LOCAL_IP"$'\n'"$PEER_IP"$'\n'"$GRE_BASE"$'\n'"$DEFAULT_MTU_ENABLE"$'\n'"$DEFAULT_MTU_VALUE"$'\n\n0\n'
+    payload=$'2\n'"$GRE_ID"$'\n'"$LOCAL_IP"$'\n'"$PEER_IP"$'\n'"$GRE_BASE"$'\n'"$DEFAULT_MTU_ENABLE"$'\n'"$DEFAULT_MTU_VALUE""$MENU_EXIT_TAIL"
   else
-    payload=$'2\n'"$GRE_ID"$'\n'"$LOCAL_IP"$'\n'"$PEER_IP"$'\n'"$GRE_BASE"$'\n'"$DEFAULT_MTU_ENABLE"$'\n\n0\n'
+    payload=$'2\n'"$GRE_ID"$'\n'"$LOCAL_IP"$'\n'"$PEER_IP"$'\n'"$GRE_BASE"$'\n'"$DEFAULT_MTU_ENABLE""$MENU_EXIT_TAIL"
   fi
 fi
 
+# Run installer (interactive)
+set +e
 run_sepehr_with_tty "$payload"
+SEPEHR_RC=$?
+set -e
 
 # ---------------------------
 # FINAL STATUS OUTPUT
 # ---------------------------
+IFACE="gre$GRE_ID"
+PING_COUNT="${PING_COUNT:-5}"
+PING_TIMEOUT_SEC="${PING_TIMEOUT_SEC:-1}"
+
 echo
 echo "=================================================="
 echo " GRE SETUP RESULT"
 echo "--------------------------------------------------"
 echo " Side        : $SIDE"
 echo " GRE ID      : $GRE_ID"
-echo " Interface   : gre$GRE_ID"
+echo " Interface   : $IFACE"
 echo " Local IP    : $LOCAL_IP"
 echo " Peer IP     : $PEER_IP"
 echo " GRE Base    : $GRE_BASE"
 echo " MTU         : $DEFAULT_MTU_VALUE"
+echo " sepehr.sh   : exit=$SEPEHR_RC"
 echo "--------------------------------------------------"
 
-# Check interface
-if ip link show "gre$GRE_ID" >/dev/null 2>&1; then
-  IF_STATE=$(ip link show "gre$GRE_ID" | grep -q "UP" && echo "UP" || echo "DOWN")
+# Interface state
+if ip link show "$IFACE" >/dev/null 2>&1; then
+  IF_STATE=$(ip link show "$IFACE" | grep -q "UP" && echo "UP" || echo "DOWN")
   echo " Interface   : $IF_STATE"
 else
   echo " Interface   : NOT FOUND"
 fi
 
-# Check systemd service
+# Service state
 if systemctl is-active --quiet "gre$GRE_ID.service"; then
   echo " Service     : ACTIVE"
 else
   echo " Service     : INACTIVE"
 fi
 
-# Show GRE IPs if exist
-GRE_IPS=$(ip addr show "gre$GRE_ID" 2>/dev/null | awk '/inet /{print $2}')
-if [[ -n "$GRE_IPS" ]]; then
-  echo " Tunnel IP   : $GRE_IPS"
+# GRE addr (if assigned)
+GRE_ADDRS=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2}' | xargs || true)
+if [[ -n "${GRE_ADDRS:-}" ]]; then
+  echo " Tunnel IP   : $GRE_ADDRS"
 else
   echo " Tunnel IP   : NOT ASSIGNED"
 fi
@@ -244,35 +291,41 @@ fi
 echo "=================================================="
 echo
 
-
 # ---------------------------
-# PING PEER CHECK (LIVE + SUMMARY)
+# PRIVATE GRE PING (LIVE + SUMMARY)
 # ---------------------------
 echo "--------------------------------------------------"
-echo " Ping Peer   : $PEER_IP (live)"
+read -r GRE_LOCAL_PRIV GRE_PEER_PRIV < <(gre_private_ips "$GRE_BASE" "$SIDE")
 
-PING_LOG="/tmp/ping_peer_${GRE_ID}.log"
+echo " Ping GRE    : $IFACE"
+echo " Local Priv  : $GRE_LOCAL_PRIV"
+echo " Peer Priv   : $GRE_PEER_PRIV (live)"
+
+PING_LOG="/tmp/ping_peer_priv_${GRE_ID}.log"
 rm -f "$PING_LOG" 2>/dev/null || true
 
-if command -v ping >/dev/null 2>&1; then
-  # live output on screen + save to log
-  set +e
-  ping -c "$PING_COUNT" -W "$PING_TIMEOUT_SEC" "$PEER_IP" 2>&1 | tee "$PING_LOG"
-  PING_RC=${PIPESTATUS[0]}
-  set -e
-
-  # summary
-  LOSS=$(awk -F',' '/packet loss/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}' "$PING_LOG" | head -n1)
-  RTT=$(awk -F'=' '/^rtt|^round-trip/ {print $2}' "$PING_LOG" | awk '{print $1}' | head -n1)
-
-  if [[ $PING_RC -eq 0 ]]; then
-    echo " Ping Result : OK (${LOSS:-"0% packet loss"})"
-  else
-    echo " Ping Result : FAIL (${LOSS:-"unknown loss"})"
-  fi
-
-  [[ -n "$RTT" ]] && echo " RTT (ms)    : $RTT"
-else
+if ! command -v ping >/dev/null 2>&1; then
   echo " Ping Result : ping command not found"
-fi
+else
+  if ! wait_for_iface "$IFACE" 40; then
+    echo " Ping Result : FAIL (interface $IFACE not found yet)"
+  else
+    set +e
+    ping -I "$IFACE" -c "$PING_COUNT" -W "$PING_TIMEOUT_SEC" "$GRE_PEER_PRIV" 2>&1 | tee "$PING_LOG"
+    PING_RC=${PIPESTATUS[0]}
+    set -e
 
+    LOSS=$(awk -F',' '/packet loss/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}' "$PING_LOG" | head -n1)
+    RTT=$(awk -F'=' '/^rtt|^round-trip/ {print $2}' "$PING_LOG" | awk '{print $1}' | head -n1)
+
+    if [[ $PING_RC -eq 0 ]]; then
+      echo " Ping Result : OK (${LOSS:-"0% packet loss"})"
+    else
+      echo " Ping Result : FAIL (${LOSS:-"unknown loss"})"
+    fi
+
+    [[ -n "${RTT:-}" ]] && echo " RTT (ms)    : $RTT"
+  fi
+fi
+echo "--------------------------------------------------"
+echo
