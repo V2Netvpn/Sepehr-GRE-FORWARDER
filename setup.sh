@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
-# setup.sh — CLI wrapper for sepehr.sh (NEW version) with robust PTY input
-#
+# setup.sh — Robust CLI wrapper for sepehr.sh (NEW)
+# - Disables clear (so you can see errors)
+# - Logs full output to /var/log/sepehr-setup-*.log
+# - Verifies greN.service + interface after run
 # Usage:
 #   ./setup.sh iran  <peer_ip> <gre_number>
 #   ./setup.sh khrej <peer_ip> <gre_number>
-#
-# - Local IPv4 auto-detect
-# - GRE base: 10.<n>0.<n>0.0   (n single digit 0..9)
-# - Ports fixed: 80 (iran only)
-# - MTU prompt auto-answer: DEFAULT_MTU_ENABLE (n by request)
-# - Cleanup old services for greN
-# - Download sepehr.sh raw
-# - Run via Python PTY (more reliable than `script`)
 
 set -euo pipefail
 
 SEPEHR_RAW_URL="https://raw.githubusercontent.com/V2Netvpn/Sepehr-GRE-FORWARDER/main/sepehr.sh"
 SEPEHR_FILE="./sepehr.sh"
 
-PORTS="80"
-DEFAULT_MTU_ENABLE="n"      # ✅ requested
-DEFAULT_MTU_VALUE="1376"    # used only if MTU_ENABLE=y
+PORTS="80"                 # iran only
+DEFAULT_MTU_ENABLE="n"      # requested
+DEFAULT_MTU_VALUE="1376"    # only used if y
+
+LOG_DIR="/var/log"
+TS="$(date +%Y%m%d-%H%M%S)"
+LOG_FILE="${LOG_DIR}/sepehr-setup-${TS}.log"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
@@ -59,7 +57,7 @@ download_sepehr(){
 
 cleanup_existing_services(){
   local id="$1"
-  echo "[CLEAN] GRE${id}: stop/disable/remove old units..."
+  echo "[CLEAN] GRE${id}: stop/disable/remove old units..." | tee -a "$LOG_FILE"
 
   systemctl stop "gre${id}.service" >/dev/null 2>&1 || true
   systemctl disable "gre${id}.service" >/dev/null 2>&1 || true
@@ -79,7 +77,39 @@ cleanup_existing_services(){
 
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl reset-failed  >/dev/null 2>&1 || true
-  echo "[CLEAN] Done."
+
+  echo "[CLEAN] Done." | tee -a "$LOG_FILE"
+}
+
+make_no_clear_path(){
+  # create dummy "clear" to prevent screen wipe
+  local d
+  d="$(mktemp -d)"
+  cat > "${d}/clear" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "${d}/clear"
+  echo "$d"
+}
+
+verify_gre(){
+  local id="$1"
+  echo "---- VERIFY gre${id} ----" | tee -a "$LOG_FILE"
+  systemctl --no-pager --full status "gre${id}.service" 2>&1 | sed -n '1,40p' | tee -a "$LOG_FILE" || true
+  echo | tee -a "$LOG_FILE"
+  ip link show "gre${id}" 2>&1 | tee -a "$LOG_FILE" || true
+  echo | tee -a "$LOG_FILE"
+  ip -4 addr show dev "gre${id}" 2>&1 | tee -a "$LOG_FILE" || true
+
+  # success heuristic: service active + interface exists
+  if systemctl is-active --quiet "gre${id}.service" && ip link show "gre${id}" >/dev/null 2>&1; then
+    echo "[OK] gre${id} is active and interface exists." | tee -a "$LOG_FILE"
+    return 0
+  fi
+
+  echo "[FAIL] gre${id} not active or interface missing." | tee -a "$LOG_FILE"
+  return 1
 }
 
 usage(){
@@ -87,10 +117,6 @@ usage(){
 Usage:
   ./setup.sh iran  <peer_ip> <gre_number>
   ./setup.sh khrej <peer_ip> <gre_number>
-
-Example:
-  ./setup.sh iran  45.89.52.101 5
-  ./setup.sh khrej 51.89.227.134 5
 EOF
 }
 
@@ -114,25 +140,28 @@ DEFAULT_MTU_ENABLE="${DEFAULT_MTU_ENABLE,,}"
 
 ensure_root "$@"
 
+mkdir -p "$LOG_DIR" >/dev/null 2>&1 || true
+touch "$LOG_FILE" >/dev/null 2>&1 || true
+
 LOCAL_IP="$(get_local_ipv4)"
 GRE_BASE="$(build_gre_base "$GRE_ID")"
 
-echo "[INFO] SIDE     : $SIDE"
-echo "[INFO] LOCAL IP : $LOCAL_IP"
-echo "[INFO] PEER IP  : $PEER_IP"
-echo "[INFO] GRE NUM  : $GRE_ID"
-echo "[INFO] GRE BASE : $GRE_BASE"
-echo "[INFO] PORTS    : $PORTS (iran only)"
-echo "[INFO] MTU      : $DEFAULT_MTU_ENABLE"
-echo
+{
+  echo "[INFO] SIDE     : $SIDE"
+  echo "[INFO] LOCAL IP : $LOCAL_IP"
+  echo "[INFO] PEER IP  : $PEER_IP"
+  echo "[INFO] GRE NUM  : $GRE_ID"
+  echo "[INFO] GRE BASE : $GRE_BASE"
+  echo "[INFO] PORTS    : $PORTS (iran only)"
+  echo "[INFO] MTU      : $DEFAULT_MTU_ENABLE"
+  echo "[INFO] LOG      : $LOG_FILE"
+  echo
+} | tee -a "$LOG_FILE"
 
 cleanup_existing_services "$GRE_ID"
 download_sepehr
 
-# Build payload (IMPORTANT):
-# - Always send: ENTER for pause_enter
-# - Always send: 0 to exit menu
-# - If MTU_ENABLE=y, also send MTU value
+# Payload (includes: enter for pause_enter + 0 for exit menu)
 if [[ "$SIDE" == "iran" ]]; then
   if [[ "$DEFAULT_MTU_ENABLE" == "y" ]]; then
     PAYLOAD=$'1\n'"$GRE_ID"$'\n'"$LOCAL_IP"$'\n'"$PEER_IP"$'\n'"$GRE_BASE"$'\n'"$PORTS"$'\n'"$DEFAULT_MTU_ENABLE"$'\n'"$DEFAULT_MTU_VALUE"$'\n\n0\n'
@@ -147,28 +176,35 @@ else
   fi
 fi
 
-# Run sepehr.sh in a real PTY and feed payload reliably
-python3 - <<'PY'
+NO_CLEAR_DIR="$(make_no_clear_path)"
+export SEPEHR_FILE
+export PAYLOAD
+export PATH="${NO_CLEAR_DIR}:${PATH}"
+
+# Run sepehr.sh in a real PTY and log all output
+python3 - <<'PY' 2>&1 | tee -a "$LOG_FILE"
 import os, pty, sys, time, select, signal
 
 sepehr = os.environ.get("SEPEHR_FILE", "./sepehr.sh")
 payload = os.environ.get("PAYLOAD", "")
+timeout = 120
 
 pid, fd = pty.fork()
 if pid == 0:
   os.execvp("bash", ["bash", sepehr])
 
-# parent
 os.set_blocking(fd, False)
 
-# write payload
-os.write(fd, payload.encode())
+# send payload
+try:
+  os.write(fd, payload.encode())
+except OSError:
+  pass
 
 start = time.time()
-timeout = 90  # seconds
-sent_extra_zero = False
-
+sent_zero_again = False
 buf = b""
+
 while True:
   if time.time() - start > timeout:
     try:
@@ -179,11 +215,11 @@ while True:
 
   r, _, _ = select.select([fd], [], [], 0.2)
   if not r:
-    # if process still alive but might be waiting at menu, send extra "0\n" once
-    if not sent_extra_zero and time.time() - start > 5:
+    # if it still waits at menu, poke "0"
+    if not sent_zero_again and time.time() - start > 4:
       try:
         os.write(fd, b"0\n")
-        sent_extra_zero = True
+        sent_zero_again = True
       except OSError:
         pass
     continue
@@ -199,17 +235,27 @@ while True:
   sys.stdout.buffer.flush()
   buf += data
 
-  # If we see main menu prompt, nudge exit (some systems consume earlier 0)
-  if b"Select option:" in buf and not sent_extra_zero:
+  if (b"Select option:" in buf or b"Select:" in buf) and not sent_zero_again:
     try:
       os.write(fd, b"0\n")
-      sent_extra_zero = True
+      sent_zero_again = True
     except OSError:
       pass
 
-# ensure child exit
 try:
   os.waitpid(pid, 0)
 except Exception:
   pass
 PY
+
+# Verify and show tail if failed
+if ! verify_gre "$GRE_ID"; then
+  echo
+  echo "========== LAST 200 LINES OF LOG =========="
+  tail -n 200 "$LOG_FILE" || true
+  echo "=========================================="
+  exit 1
+fi
+
+echo
+echo "[DONE] Success. Log: $LOG_FILE"
