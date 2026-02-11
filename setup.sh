@@ -25,7 +25,7 @@ DEFAULT_MTU_ENABLE="n"      # y/n
 DEFAULT_MTU_VALUE="1376"    # only used if DEFAULT_MTU_ENABLE=y
 
 # Private GRE ping settings
-PING_COUNT=5
+PING_COUNT=50
 PING_TIMEOUT_SEC=1
 
 # Tail inputs to force exit from sepehr menu reliably:
