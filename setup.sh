@@ -73,9 +73,24 @@ build_gre_base() {
 }
 
 download_sepehr() {
+  if [[ -f "$SEPEHR_FILE" && -s "$SEPEHR_FILE" ]]; then
+    echo "[INFO] Using existing $SEPEHR_FILE"
+    chmod +x "$SEPEHR_FILE" || die "chmod failed"
+    return 0
+  fi
+
+  echo "[INFO] Downloading fresh sepehr.sh..."
+
   command -v wget >/dev/null 2>&1 || die "wget not found"
-  wget -O "$SEPEHR_FILE" "${SEPEHR_RAW_URL}?$(date +%s)" >/dev/null
-  chmod +x "$SEPEHR_FILE"
+
+  wget -O "$SEPEHR_FILE" "${SEPEHR_RAW_URL}?$(date +%s)" \
+    || die "Download failed"
+
+  [[ -s "$SEPEHR_FILE" ]] || die "Downloaded file is empty"
+
+  chmod +x "$SEPEHR_FILE" || die "chmod failed"
+
+  echo "[INFO] Download OK"
 }
 
 cleanup_existing_services() {
